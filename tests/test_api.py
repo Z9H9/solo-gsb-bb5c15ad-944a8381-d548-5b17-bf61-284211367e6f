@@ -2868,3 +2868,327 @@ def test_openapi_documents_release_and_cooldown_listing_endpoints(client):
     assert "422" in delete_op["responses"]
     list_op = paths["/namespaces/{namespace}/cooldowns"]["get"]
     assert "200" in list_op["responses"]
+
+
+# ---------- 跨空间同形风险簇 POST /name-risk-clusters ----------
+
+
+# 传递链三元组（规范化后仍是单字符）：
+# "A" -> "a"，与 Cherokee Ꭺ(U+13AA) 同形；Ꭺ 与小大写 ᴀ(U+1D00) 同形；
+# 但 "a" 与 ᴀ 不同形 —— 用于验证 A-B、B-C 即使 A-C 不冲突也归入同簇
+CHEROKEE_GO = "Ꭺ"
+SMALL_CAPITAL_A = "ᴀ"
+
+
+def risk_clusters(client, namespaces, max_names=500):
+    return client.post(
+        "/name-risk-clusters",
+        json={"namespaces": namespaces, "max_names": max_names},
+    )
+
+
+def test_risk_clusters_confusable_pair_forms_single_cluster(client):
+    chat_id = register(client, "app", namespace="chat").json()["id"]
+    forum_id = register(client, CYRILLIC_APP, namespace="forum").json()["id"]
+
+    resp = risk_clusters(client, ["forum", "chat"])  # 故意乱序，验证确定性
+    assert resp.status_code == 200
+    body = resp.json()
+    # namespaces 按字典序规范化返回
+    assert body["namespaces"] == ["chat", "forum"]
+    assert body["max_names"] == 500
+    assert body["snapshot_count"] == 2
+    assert len(body["clusters"]) == 1
+    cluster = body["clusters"][0]
+    assert cluster["cluster_id"] == 1
+    assert [n["namespace"] for n in cluster["nodes"]] == ["chat", "forum"]
+    # registered 节点不含 expires_at
+    assert all("expires_at" not in n for n in cluster["nodes"])
+    chat_node = cluster["nodes"][0]
+    assert chat_node == {
+        "namespace": "chat",
+        "kind": "registered",
+        "id": chat_id,
+        "original_name": "app",
+        "normalized_name": "app",
+    }
+    # 边端点是稳定标识 namespace/kind/id，小者为 source
+    edge = cluster["edges"][0]
+    assert edge["source"] == {"namespace": "chat", "kind": "registered", "id": chat_id}
+    assert edge["target"] == {"namespace": "forum", "kind": "registered", "id": forum_id}
+    assert edge["reasons"] == ["confusable"]
+
+
+def test_risk_clusters_normalized_match_edge_reason(client):
+    assert register(client, "Alice", namespace="a").status_code == 201
+    assert register(client, "ALICE", namespace="b").status_code == 201
+
+    body = risk_clusters(client, ["a", "b"]).json()
+    assert len(body["clusters"]) == 1
+    edge = body["clusters"][0]["edges"][0]
+    assert edge["reasons"] == ["normalized_match"]
+
+
+def test_risk_clusters_transitive_chain_merges_even_without_direct_edge(client):
+    # a/A --confusable--> b/Ꭺ --confusable--> c/ᴀ，而 a 与 c 不同形：
+    # 连通分量仍把三者归入同一簇，边恰好只有两条
+    assert register(client, "A", namespace="a").status_code == 201
+    assert register(client, CHEROKEE_GO, namespace="b").status_code == 201
+    assert register(client, SMALL_CAPITAL_A, namespace="c").status_code == 201
+
+    body = risk_clusters(client, ["c", "b", "a"]).json()
+    assert body["snapshot_count"] == 3
+    assert len(body["clusters"]) == 1
+    cluster = body["clusters"][0]
+    assert [n["namespace"] for n in cluster["nodes"]] == ["a", "b", "c"]
+    assert len(cluster["edges"]) == 2
+    pairs = sorted((e["source"]["namespace"], e["target"]["namespace"]) for e in cluster["edges"])
+    assert pairs == [("a", "b"), ("b", "c")]
+    assert all(e["reasons"] == ["confusable"] for e in cluster["edges"])
+
+
+def test_risk_clusters_same_namespace_names_never_get_edges(client):
+    # 同一命名空间内（直接插库绕过写入拦截）的同形记录不建边，
+    # 只有跨空间的边能把节点带入簇
+    conn = database.get_connection()
+    try:
+        service.insert_name(conn, "a", "app", "app")
+        service.insert_name(conn, "a", CYRILLIC_APP, CYRILLIC_APP)
+        service.insert_name(conn, "b", "арр-bridge", "арр-bridge")
+    finally:
+        conn.close()
+    # 只查 a：两条同空间记录即使同形也不形成簇
+    body = risk_clusters(client, ["a", "empty"]).json()
+    assert body["snapshot_count"] == 2
+    assert body["clusters"] == []
+
+    # 引入与之跨空间同形的第三空间（app 与 арр-bridge 不同形，单独造一个
+    # 与 арр 同形的第三空间名称）：app-арр 是跨空间边，同空间的 арр 被带入簇
+    assert register(client, CYRILLIC_APP, namespace="c").status_code == 201
+    body = risk_clusters(client, ["a", "c"]).json()
+    assert len(body["clusters"]) == 1
+    namespaces = sorted(n["namespace"] for n in body["clusters"][0]["nodes"])
+    assert namespaces == ["a", "a", "c"]
+    for edge in body["clusters"][0]["edges"]:
+        assert edge["source"]["namespace"] != edge["target"]["namespace"]
+
+
+def test_risk_clusters_unrelated_names_yield_empty_clusters(client):
+    assert register(client, "alice", namespace="a").status_code == 201
+    assert register(client, "bob", namespace="b").status_code == 201
+    body = risk_clusters(client, ["a", "b"]).json()
+    assert body["snapshot_count"] == 2
+    assert body["clusters"] == []
+
+
+def test_risk_clusters_include_active_reservations_and_cooldowns_with_expires_at(client):
+    reservation = reserve(client, CYRILLIC_APP, ttl_seconds=300, namespace="d").json()
+    created = register(client, "APP", namespace="e").json()
+    cooldown = release(
+        client, created["id"], expected_revision=1, cooldown_seconds=3600, namespace="e"
+    ).json()
+
+    body = risk_clusters(client, ["d", "e"]).json()
+    assert body["snapshot_count"] == 2  # 1 条有效预占 + 1 条未过期冷却
+    cluster = body["clusters"][0]
+    by_kind = {n["kind"]: n for n in cluster["nodes"]}
+    assert set(by_kind) == {"reservation", "released"}
+    assert by_kind["reservation"]["id"] == reservation["id"]
+    assert by_kind["reservation"]["expires_at"] == reservation["expires_at"]
+    assert by_kind["released"]["id"] == cooldown["id"]
+    assert by_kind["released"]["expires_at"] == cooldown["expires_at"]
+    edge = cluster["edges"][0]
+    # kind 排序 registered(0) < reservation(1) < released(2)：reservation 为 source
+    assert edge["source"]["kind"] == "reservation"
+    assert edge["target"]["kind"] == "released"
+    assert edge["reasons"] == ["confusable"]
+
+
+def test_risk_clusters_exclude_expired_and_consumed_records(client):
+    reserve(client, "app", ttl_seconds=30, namespace="a")
+    consumed = reserve(client, "gone", ttl_seconds=300, namespace="a").json()
+    assert claim(client, consumed["token"], namespace="a").status_code == 201
+    created = register(client, "cool", namespace="a").json()
+    release(client, created["id"], expected_revision=1, cooldown_seconds=60, namespace="a")
+    conn = database.get_connection()
+    try:
+        conn.execute(
+            "UPDATE name_reservations SET expires_at = '2000-01-01T00:00:00.000Z' "
+            "WHERE original_name = 'app'"
+        )
+        conn.execute(
+            "UPDATE name_cooldowns SET expires_at = '2000-01-01T00:00:00.000Z'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 快照只含已消费后注册的 gone：过期预占 / 过期冷却 / 已消费预占都不计入
+    body = risk_clusters(client, ["a", "b"]).json()
+    assert body["snapshot_count"] == 1
+    assert body["clusters"] == []
+    # 只读分析不清理：过期记录物理上仍在
+    conn = database.get_connection()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM name_cooldowns").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM name_reservations").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_risk_clusters_413_when_snapshot_exceeds_max_names_and_does_not_truncate(client):
+    assert register(client, "alice", namespace="a").status_code == 201
+    assert register(client, "bob", namespace="b").status_code == 201  # 与 alice 无关
+    assert register(client, "app", namespace="c").status_code == 201
+
+    # max_names=2：快照 3 个节点 -> 413，即便真正冲突的只有 app 一侧也不截断
+    resp = risk_clusters(client, ["a", "b", "c"], max_names=2)
+    assert resp.status_code == 413
+    detail = resp.json()["detail"]
+    assert detail["error"] == "risk_snapshot_too_large"
+    assert detail["snapshot_count"] == 3
+    assert detail["max_names"] == 2
+
+    # 边界：恰好等于 max_names 时正常计算
+    resp = risk_clusters(client, ["a", "b", "c"], max_names=3)
+    assert resp.status_code == 200
+    assert resp.json()["snapshot_count"] == 3
+
+    # 413 只过滤时间维度（过期 / 已消费），不按 max_names 截断：预置一条过期记录，
+    # 它不计入快照，总量降回上限内时计算正常
+    created = register(client, "dave", namespace="d").json()
+    release(client, created["id"], expected_revision=1, cooldown_seconds=60, namespace="d")
+    conn = database.get_connection()
+    try:
+        conn.execute(
+            "UPDATE name_cooldowns SET expires_at = '2000-01-01T00:00:00.000Z'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    resp = risk_clusters(client, ["a", "b", "c", "d"], max_names=3)
+    assert resp.status_code == 200
+    assert resp.json()["snapshot_count"] == 3
+
+
+def test_risk_clusters_ordering_is_deterministic(client):
+    # 多簇、多节点、多种 kind：验证簇 / 节点 / 边排序与 cluster_id 稳定
+    app_a = register(client, "app", namespace="a").json()["id"]
+    app_b = register(client, CYRILLIC_APP, namespace="b").json()["id"]
+    alice_a = register(client, "Alice", namespace="a").json()["id"]
+    alice_c = register(client, "ALICE", namespace="c").json()["id"]
+
+    first = risk_clusters(client, ["c", "b", "a"]).json()
+    second = risk_clusters(client, ["a", "b", "c"]).json()
+    assert first == second  # 与请求顺序无关
+
+    # 簇按簇内最小节点键排序：a/app 的 id 小于 a/Alice，故 app 簇为第 1 簇
+    assert len(first["clusters"]) == 2
+    assert first["clusters"][0]["cluster_id"] == 1
+    assert first["clusters"][1]["cluster_id"] == 2
+    first_members = {(n["namespace"], n["id"]) for n in first["clusters"][0]["nodes"]}
+    assert first_members == {("a", app_a), ("b", app_b)}
+    second_members = {(n["namespace"], n["id"]) for n in first["clusters"][1]["nodes"]}
+    assert second_members == {("a", alice_a), ("c", alice_c)}
+
+
+def test_risk_clusters_unknown_namespaces_and_empty_snapshot(client):
+    # 不存在的命名空间：快照为 0，簇为空
+    body = risk_clusters(client, ["no-such", "ghost"]).json()
+    assert body["namespaces"] == ["ghost", "no-such"]
+    assert body["snapshot_count"] == 0
+    assert body["clusters"] == []
+
+
+def test_risk_clusters_request_validation(client):
+    # 少于 2 个 / 多于 20 个命名空间 -> 422
+    assert risk_clusters(client, ["a"]).status_code == 422
+    assert risk_clusters(client, [f"ns{i}" for i in range(21)]).status_code == 422
+    # 重复命名空间 -> 422
+    assert risk_clusters(client, ["a", "a"]).status_code == 422
+    # 空白命名空间 -> 422
+    assert risk_clusters(client, ["a", "  "]).status_code == 422
+    # max_names 越界（1–500）-> 422
+    assert risk_clusters(client, ["a", "b"], max_names=0).status_code == 422
+    assert risk_clusters(client, ["a", "b"], max_names=501).status_code == 422
+    # 缺字段 -> 422
+    assert client.post("/name-risk-clusters", json={"namespaces": ["a", "b"]}).status_code == 422
+    assert client.post(
+        "/name-risk-clusters", json={"max_names": 10}
+    ).status_code == 422
+
+
+def test_risk_clusters_fix_snapshot_in_single_read_transaction_wal(client, monkeypatch):
+    """WAL 下读事务快照固定：事务开始后另一连接的提交不影响本次分簇。
+
+    已注册名称表先读；在预占表读取前，另一连接提交一个会与既有名称形成
+    跨空间同形簇的预占。单一 BEGIN 读事务保证该提交对本事务不可见：
+    结果快照不含新预占，也不产生对应的新簇。
+    """
+    assert register(client, "app", namespace="a").status_code == 201
+    conn = database.get_connection()
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    finally:
+        conn.close()
+
+    real_reservation_rows = service._reservation_snapshot_rows
+    injected = {"done": False}
+
+    def racing_reservation_rows(read_conn, namespaces, now):
+        # 读事务已开始且已读完 display_names：另一连接提交新的有效预占
+        # （仅在第一次调用时注入，第二次请求应直接读到该预占）
+        if not injected["done"]:
+            injected["done"] = True
+            other = database.get_connection()
+            try:
+                other.execute(
+                    """
+                    INSERT INTO name_reservations
+                        (namespace, original_name, normalized_name, token, expires_at)
+                    VALUES ('b', ?, ?, 'racing-token', '2999-01-01T00:00:00.000Z')
+                    """,
+                    (CYRILLIC_APP, CYRILLIC_APP),
+                )
+                other.commit()
+            finally:
+                other.close()
+        return real_reservation_rows(read_conn, namespaces, now)
+
+    monkeypatch.setattr(service, "_reservation_snapshot_rows", racing_reservation_rows)
+
+    body = risk_clusters(client, ["a", "b"]).json()
+    # 新预占在本事务快照之后提交：不计入快照、不形成簇
+    assert body["snapshot_count"] == 1
+    assert body["clusters"] == []
+
+    # 不带注入再次调用：新预占可见，正常形成跨空间簇
+    resp = risk_clusters(client, ["a", "b"])
+    assert resp.status_code == 200
+    assert resp.json()["snapshot_count"] == 2
+    assert len(resp.json()["clusters"]) == 1
+
+
+def test_risk_clusters_service_raises_on_oversized_snapshot_without_truncation(client):
+    """服务层：快照超限抛 RiskSnapshotTooLargeError，携带真实总数；不做任何计算。"""
+    conn = database.get_connection()
+    try:
+        service.insert_name(conn, "a", "app", "app")
+        service.insert_name(conn, "b", CYRILLIC_APP, CYRILLIC_APP)
+        with pytest.raises(service.RiskSnapshotTooLargeError) as exc_info:
+            service.find_name_risk_clusters(conn, ["a", "b"], max_names=1)
+        assert exc_info.value.snapshot_count == 2
+        assert exc_info.value.limit == 1
+
+        # 只读事务已结束（rollback）：连接可正常复用，数据原样
+        assert [r["original_name"] for r in service.list_names(conn, "a")] == ["app"]
+        assert [r["original_name"] for r in service.list_names(conn, "b")] == [CYRILLIC_APP]
+    finally:
+        conn.close()
+
+
+def test_openapi_documents_name_risk_clusters_endpoint(client):
+    operation = client.get("/openapi.json").json()["paths"]["/name-risk-clusters"]["post"]
+    assert "200" in operation["responses"]
+    assert "413" in operation["responses"]
+    assert "422" in operation["responses"]

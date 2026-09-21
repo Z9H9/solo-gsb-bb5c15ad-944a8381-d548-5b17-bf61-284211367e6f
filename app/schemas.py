@@ -292,6 +292,41 @@ class MergeRequest(BaseModel):
     )
 
 
+# 跨空间风险簇分析：命名空间数量与快照节点总量上限
+MIN_RISK_NAMESPACES = 2
+MAX_RISK_NAMESPACES = 20
+MAX_RISK_SNAPSHOT = 500
+
+
+class NameRiskClustersRequest(BaseModel):
+    """跨空间同形风险簇请求体：2–20 个互不相同的命名空间 + 快照节点上限（≤500）。"""
+
+    namespaces: list[NamespaceStr] = Field(
+        min_length=MIN_RISK_NAMESPACES,
+        max_length=MAX_RISK_NAMESPACES,
+        examples=[["chat", "forum", "marketplace"]],
+        description=(
+            "待联合分析的命名空间列表：恰好 2–20 个且互不相同；只对不同命名空间"
+            "之间的名称建边，同一命名空间内部不建边"
+        ),
+    )
+    max_names: int = Field(
+        ge=1,
+        le=MAX_RISK_SNAPSHOT,
+        examples=[500],
+        description=(
+            "这些命名空间内已注册名称、有效预占与未过期冷却快照节点的总量上限；"
+            "实际快照总量超过该值时返回 413 且不做截断计算"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _require_distinct_namespaces(self) -> "NameRiskClustersRequest":
+        if len(set(self.namespaces)) != len(self.namespaces):
+            raise ValueError("namespaces 中的命名空间必须互不相同")
+        return self
+
+
 class MergeResult(BaseModel):
     """合并成功响应：迁入目标命名空间的记录数量。"""
 
@@ -303,6 +338,86 @@ class MergeResult(BaseModel):
     )
     merged_cooldowns: int = Field(
         description="迁移的有效释放冷却记录数量（过期冷却已惰性清理，不迁移）"
+    )
+
+
+# 跨空间同形风险簇的三类节点：kind 同时作为判别联合的 discriminator
+RiskNodeKind = Literal["registered", "reservation", "released"]
+RiskEdgeReason = Literal["normalized_match", "confusable"]
+
+
+class RiskNodeRef(BaseModel):
+    """簇中边端点的节点稳定标识：namespace + kind + id 唯一确定一个快照节点。"""
+
+    namespace: str
+    kind: RiskNodeKind
+    id: int
+
+
+class RiskNodeBase(BaseModel):
+    """风险簇节点的公共字段（节点稳定标识 + 原名 / 规范名）。"""
+
+    namespace: str
+    id: int
+    original_name: str
+    normalized_name: str
+
+
+class RegisteredRiskNode(RiskNodeBase):
+    """已注册名称节点：无 expires_at。"""
+
+    kind: Literal["registered"] = "registered"
+
+
+class ExpiringRiskNode(RiskNodeBase):
+    """有效预占 / 未过期释放冷却节点：附 expires_at。"""
+
+    kind: Literal["reservation", "released"]
+    expires_at: str = Field(description="预占有效期 / 冷却到期时刻（UTC ISO 8601）")
+
+
+RiskNode = Annotated[
+    RegisteredRiskNode | ExpiringRiskNode, Field(discriminator="kind")
+]
+
+
+class RiskEdge(BaseModel):
+    """风险簇中的一条跨空间边：两端节点稳定标识 + 建边原因。"""
+
+    source: RiskNodeRef = Field(description="按 (namespace, kind, id) 排序后的较小端")
+    target: RiskNodeRef = Field(description="按 (namespace, kind, id) 排序后的较大端")
+    reasons: list[RiskEdgeReason] = Field(
+        description="建边原因：normalized_match（规范名相同）或 confusable（同形），排序后给出"
+    )
+
+
+class RiskCluster(BaseModel):
+    """跨空间同形风险簇：一个连通分量，至少含 2 个节点且至少一条跨空间边。"""
+
+    cluster_id: int = Field(description="簇编号：按簇内最小节点标识确定性地从 1 开始编号")
+    nodes: list[RiskNode] = Field(
+        description="簇内全部节点，按 (namespace, kind, id) 升序排列"
+    )
+    edges: list[RiskEdge] = Field(
+        description="簇内全部跨空间边，按 (source, target, reasons) 升序排列"
+    )
+
+
+class NameRiskClustersResponse(BaseModel):
+    """跨空间同形风险簇分析结果。"""
+
+    namespaces: list[str] = Field(
+        description="本次分析的命名空间（按字典序规范化后的输入集合）"
+    )
+    max_names: int = Field(description="请求给定的快照节点总量上限")
+    snapshot_count: int = Field(
+        description=(
+            "同一读事务快照内命中的节点总数（已注册名称 + 有效预占 + 未过期冷却）；"
+            "该值不超过 max_names 时才会进行分簇计算"
+        )
+    )
+    clusters: list[RiskCluster] = Field(
+        description="至少含 2 个节点的风险簇，按簇内最小节点标识升序排列"
     )
 
 

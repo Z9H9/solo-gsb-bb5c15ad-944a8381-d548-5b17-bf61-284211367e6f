@@ -86,6 +86,24 @@
    脚本策略 PUT 的影响面扫描（违规明细 kind="released"）
 3. 过期冷却记录不参与任何判定，在每个写事务开始时惰性物理删除；
    GET /namespaces/{namespace}/cooldowns 只读列出仍有效的冷却记录
+
+跨空间同形风险簇（find_name_risk_clusters，POST /name-risk-clusters）：
+1. 接收 2–20 个互不相同的命名空间与 max_names（1–500），在单个只读
+   事务（BEGIN 读事务）中依次读取这些空间的已注册名称、未过期未消费
+   预占与未过期冷却；同一事务保证三类数据来自同一份数据库快照，并发
+   写入在事务期间提交也不改变本函数看到的节点集合。只读路径不做任何
+   惰性清理，过期 / 已消费记录在 Python 侧过滤
+2. 快照节点总量超过 max_names 时抛 RiskSnapshotTooLargeError（-> 413），
+   绝不截断快照后继续计算
+3. 只对不同命名空间的节点建边：normalized_name 相同记 normalized_match
+   （先按规范名分组、组内跨空间两两连边），否则 is_confusable 同形记
+   confusable（按规范名去重后两两判定，同规范名不再重复比较）；同空间
+   内部不建边。并查集求连通分量，只保留至少含 2 个节点的分量：A-B、
+   B-C 即使 A-C 不直接冲突也归入同一簇
+4. 节点稳定标识为 (namespace, kind, id)，kind 排序 registered <
+   reservation < released，预占与冷却附 expires_at；边端点小者为
+   source 并附 reasons；簇按最小节点键排序、cluster_id 从 1 编号，
+   簇内节点与边均确定性排序
 """
 from __future__ import annotations
 
@@ -252,6 +270,20 @@ class BatchMixedScriptError(Exception):
     def __init__(self, items: list[dict]):
         super().__init__("mixed_script_violation")
         self.items = items
+
+
+class RiskSnapshotTooLargeError(Exception):
+    """跨空间风险簇快照节点总量超过请求方给定的 max_names（HTTP 413）。
+
+    snapshot_count 为同一读事务快照内的实际节点总数（已注册名称 + 有效预占
+    + 未过期冷却），limit 为请求方给定的上限；超限后不做任何分簇计算，
+    绝不为了凑上限而截断快照。
+    """
+
+    def __init__(self, snapshot_count: int, limit: int):
+        super().__init__("risk_snapshot_too_large")
+        self.snapshot_count = snapshot_count
+        self.limit = limit
 
 
 def utc_now() -> datetime:
@@ -1533,3 +1565,279 @@ def list_cooldowns(conn: sqlite3.Connection, namespace: str) -> list[dict]:
         for row in rows
         if parse_expires_at(row["expires_at"]) > moment
     ]
+
+
+# ---------- 跨空间同形风险簇 ----------
+
+
+# 节点类型在排序键 / 稳定标识中的先后顺序（registered < reservation < released）
+RISK_KIND_ORDER = {
+    SOURCE_REGISTERED: 0,
+    SOURCE_RESERVATION: 1,
+    SOURCE_RELEASED: 2,
+}
+
+
+def _registered_snapshot_rows(
+    conn: sqlite3.Connection, namespaces: tuple[str, ...]
+) -> list[dict]:
+    """读取多个命名空间的全部已注册名称（单独函数，便于并发测试注入）。"""
+    placeholders = ", ".join("?" for _ in namespaces)
+    rows = conn.execute(
+        f"""
+        SELECT namespace, id, original_name, normalized_name
+        FROM display_names
+        WHERE namespace IN ({placeholders})
+        ORDER BY namespace, id
+        """,
+        namespaces,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _reservation_snapshot_rows(
+    conn: sqlite3.Connection, namespaces: tuple[str, ...], now: datetime
+) -> list[dict]:
+    """读取多个命名空间的未消费、未过期预占（单独函数，便于并发测试注入）。"""
+    placeholders = ", ".join("?" for _ in namespaces)
+    rows = conn.execute(
+        f"""
+        SELECT namespace, id, original_name, normalized_name, expires_at
+        FROM name_reservations
+        WHERE namespace IN ({placeholders}) AND consumed_at IS NULL
+        ORDER BY namespace, id
+        """,
+        namespaces,
+    ).fetchall()
+    return [
+        dict(row)
+        for row in rows
+        if parse_expires_at(row["expires_at"]) > now
+    ]
+
+
+def _cooldown_snapshot_rows(
+    conn: sqlite3.Connection, namespaces: tuple[str, ...], now: datetime
+) -> list[dict]:
+    """读取多个命名空间的未过期释放冷却记录（单独函数，便于并发测试注入）。"""
+    placeholders = ", ".join("?" for _ in namespaces)
+    rows = conn.execute(
+        f"""
+        SELECT namespace, id, original_name, normalized_name, expires_at
+        FROM name_cooldowns
+        WHERE namespace IN ({placeholders})
+        ORDER BY namespace, id
+        """,
+        namespaces,
+    ).fetchall()
+    return [
+        dict(row)
+        for row in rows
+        if parse_expires_at(row["expires_at"]) > now
+    ]
+
+
+def _node_key(node: dict) -> tuple[str, int, int]:
+    """节点稳定排序 / 标识键：namespace、kind 序值、id。"""
+    return node["namespace"], RISK_KIND_ORDER[node["kind"]], node["id"]
+
+
+class _UnionFind:
+    """按秩合并的并查集：以快照节点下标为元素，用于求跨空间边的连通分量。"""
+
+    def __init__(self, size: int):
+        self.parent = list(range(size))
+        self.rank = [0] * size
+
+    def find(self, index: int) -> int:
+        while self.parent[index] != index:
+            self.parent[index] = self.parent[self.parent[index]]
+            index = self.parent[index]
+        return index
+
+    def union(self, left: int, right: int) -> None:
+        left_root, right_root = self.find(left), self.find(right)
+        if left_root == right_root:
+            return
+        if self.rank[left_root] < self.rank[right_root]:
+            left_root, right_root = right_root, left_root
+        self.parent[right_root] = left_root
+        if self.rank[left_root] == self.rank[right_root]:
+            self.rank[left_root] += 1
+
+
+def find_name_risk_clusters(
+    conn: sqlite3.Connection,
+    namespaces: list[str],
+    max_names: int,
+    now: datetime | None = None,
+) -> dict:
+    """跨命名空间同形风险簇：在读事务快照上固定各空间的三类名称并分簇。
+
+    在**同一个只读事务（BEGIN 读事务）**中依次读取这些命名空间的已注册
+    名称、有效预占与未过期冷却，保证后续判定基于同一份数据库快照（并发
+    写入在事务期间提交也不改变本函数看到的节点集合）；只读路径不做任何
+    惰性清理，过期 / 已消费记录在 Python 侧过滤，与 check 等只读接口一致。
+
+    快照节点总数（三类记录之和）超过 max_names 时立即抛
+    RiskSnapshotTooLargeError（-> 413），绝不截断快照后继续计算。
+
+    建边规则：仅对**不同命名空间**的两个节点，按
+      1. normalized_name 完全相等 -> normalized_match
+      2. 否则 confusables 同形 -> confusable
+    建边；同一命名空间内部不建边（空间内写入时已保证互不冲突）。再按
+    并查集求连通分量，只保留至少含 2 个节点的分量：因此 A-B、B-C 建边
+    而 A-C 不直接冲突时三者仍归入同一簇。簇、节点、边全部确定性排序：
+      - 节点键 (namespace, kind 序, id)，registered < reservation < released
+      - 边按 (source 键, target 键) 排序，端点小者为 source
+      - 簇按簇内最小节点键排序，cluster_id 从 1 顺序编号
+    """
+    moment = now or utc_now()
+    ordered_namespaces = tuple(sorted(set(namespaces)))
+
+    # 单一读事务固定全部快照：事务期间其他连接的提交对本连接不可见
+    conn.execute("BEGIN")
+    try:
+        registered = _registered_snapshot_rows(conn, ordered_namespaces)
+        reservations = _reservation_snapshot_rows(conn, ordered_namespaces, moment)
+        cooldowns = _cooldown_snapshot_rows(conn, ordered_namespaces, moment)
+
+        nodes: list[dict] = []
+        for row in registered:
+            nodes.append({**row, "kind": SOURCE_REGISTERED})
+        for row in reservations:
+            nodes.append({**row, "kind": SOURCE_RESERVATION})
+        for row in cooldowns:
+            nodes.append({**row, "kind": SOURCE_RELEASED})
+
+        snapshot_count = len(nodes)
+        if snapshot_count > max_names:
+            raise RiskSnapshotTooLargeError(snapshot_count, max_names)
+
+        union_find = _UnionFind(snapshot_count)
+        # edges[(i, j)] = {"normalized_match", "confusable"}（i < j）
+        edges: dict[tuple[int, int], set[str]] = {}
+
+        def link(left: int, right: int, reason: str) -> None:
+            if left > right:
+                left, right = right, left
+            union_find.union(left, right)
+            edges.setdefault((left, right), set()).add(reason)
+
+        # 1. 规范名相同：先按 normalized_name 分组，组内跨空间两两连边。
+        #    同一空间内的记录在写入时已保证规范名唯一，故组内同空间至多一条。
+        by_normalized: dict[str, list[int]] = {}
+        for index, node in enumerate(nodes):
+            by_normalized.setdefault(node["normalized_name"], []).append(index)
+        for indices in by_normalized.values():
+            if len(indices) < 2:
+                continue
+            for left_pos in range(len(indices)):
+                for right_pos in range(left_pos + 1, len(indices)):
+                    left, right = indices[left_pos], indices[right_pos]
+                    if nodes[left]["namespace"] != nodes[right]["namespace"]:
+                        link(left, right, REASON_NORMALIZED_MATCH)
+
+        # 2. 同形：只比较规范名不同的跨空间节点对；同规范名上一步已建边。
+        #    按规范名去重后两两判定（is_confusable 结果按无序规范名对缓存），
+        #    一个规范名可能被多个空间的多个节点（registered/reservation/released）持有。
+        normalized_names = sorted(by_normalized)
+        confusable_pairs: set[tuple[str, str]] = set()
+        for left_pos in range(len(normalized_names)):
+            for right_pos in range(left_pos + 1, len(normalized_names)):
+                left_norm, right_norm = (
+                    normalized_names[left_pos],
+                    normalized_names[right_pos],
+                )
+                if is_confusable(left_norm, right_norm):
+                    confusable_pairs.add((left_norm, right_norm))
+        for left_norm, right_norm in confusable_pairs:
+            for left in by_normalized[left_norm]:
+                for right in by_normalized[right_norm]:
+                    if nodes[left]["namespace"] != nodes[right]["namespace"]:
+                        link(left, right, REASON_CONFUSABLE)
+    finally:
+        conn.rollback()
+
+    # 3. 连通分量：只保留至少 2 个节点的分量（无跨空间边的孤立节点丢弃）
+    members: dict[int, list[int]] = {}
+    for index in range(snapshot_count):
+        members.setdefault(union_find.find(index), []).append(index)
+    components = [
+        sorted(indices, key=lambda idx: _node_key(nodes[idx]))
+        for indices in members.values()
+        if len(indices) >= 2
+    ]
+
+    # 簇按簇内最小节点键确定性排序，cluster_id 从 1 顺序编号
+    components.sort(key=lambda indices: _node_key(nodes[indices[0]]))
+
+    clusters: list[dict] = []
+    for cluster_id, component in enumerate(components, start=1):
+        component_set = set(component)
+        cluster_edges: list[dict] = []
+        for (left, right), reasons in edges.items():
+            if left not in component_set:
+                continue
+            # 边端点按节点键 (namespace, kind, id) 确定小者为 source
+            if _node_key(nodes[left]) <= _node_key(nodes[right]):
+                source_node, target_node = nodes[left], nodes[right]
+            else:
+                source_node, target_node = nodes[right], nodes[left]
+            cluster_edges.append(
+                {
+                    "source": _node_ref(source_node),
+                    "target": _node_ref(target_node),
+                    "reasons": sorted(
+                        reasons,
+                        key={
+                            REASON_NORMALIZED_MATCH: 0,
+                            REASON_CONFUSABLE: 1,
+                        }.get,
+                    ),
+                }
+            )
+        cluster_edges.sort(key=_edge_sort_key)
+        clusters.append(
+            {
+                "cluster_id": cluster_id,
+                "nodes": [_risk_node_payload(nodes[index]) for index in component],
+                "edges": cluster_edges,
+            }
+        )
+
+    return {
+        "namespaces": list(ordered_namespaces),
+        "max_names": max_names,
+        "snapshot_count": snapshot_count,
+        "clusters": clusters,
+    }
+
+
+def _node_ref(node: dict) -> dict:
+    """边端点的稳定标识：仅 namespace / kind / id。"""
+    return {"namespace": node["namespace"], "kind": node["kind"], "id": node["id"]}
+
+
+def _risk_node_payload(node: dict) -> dict:
+    """簇节点响应载荷：稳定标识 + 原名 / 规范名，预占与冷却附 expires_at。"""
+    payload = {
+        "namespace": node["namespace"],
+        "kind": node["kind"],
+        "id": node["id"],
+        "original_name": node["original_name"],
+        "normalized_name": node["normalized_name"],
+    }
+    if node["kind"] in (SOURCE_RESERVATION, SOURCE_RELEASED):
+        payload["expires_at"] = node["expires_at"]
+    return payload
+
+
+def _edge_sort_key(edge: dict) -> tuple:
+    """边的确定性排序键：source 节点键、target 节点键、reasons 序列。"""
+    source, target = edge["source"], edge["target"]
+    return (
+        (source["namespace"], RISK_KIND_ORDER[source["kind"]], source["id"]),
+        (target["namespace"], RISK_KIND_ORDER[target["kind"]], target["id"]),
+        tuple(edge["reasons"]),
+    )

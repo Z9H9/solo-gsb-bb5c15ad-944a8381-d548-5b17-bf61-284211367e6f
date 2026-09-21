@@ -14,6 +14,7 @@
 - GET    /namespaces/{namespace}/script-policy                      读取命名空间混脚本策略（200 / 404）
 - POST   /namespaces/{namespace}/check                              只分析不落库（200）
 - GET    /namespaces/{namespace}/names                              列出命名空间内已注册名称
+- POST   /name-risk-clusters                                        跨空间同形风险簇（200 / 413 / 422，单一读事务快照）
 - GET    /health                                                    健康检查
 """
 from __future__ import annotations
@@ -36,6 +37,8 @@ from .schemas import (
     MergeResult,
     NameRecord,
     NameRequest,
+    NameRiskClustersRequest,
+    NameRiskClustersResponse,
     ReleaseRequest,
     RenameRequest,
     ReservationRecord,
@@ -56,7 +59,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Unicode Display Name Anti-Spoofing API",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "命名空间内的显示名防仿冒：NFKC+casefold 规范名查重、"
         "confusables 同形字符判定；混脚本拦截支持命名空间级策略"
@@ -70,7 +73,12 @@ app = FastAPI(
         "单事务内校验双方归属与版本后成对互换名称并各递增 revision；"
         "支持删除名称并设置释放冷却（DELETE）：单事务内校验归属与版本后删除"
         "名称并生成带 expires_at 的冷却记录，冷却到期前与已注册名称、有效预占"
-        "同等参与全部规范名、同形与混脚本判定（冲突明细 source=released）。"
+        "同等参与全部规范名、同形与混脚本判定（冲突明细 source=released）；"
+        "支持跨命名空间同形风险簇分析（POST /name-risk-clusters）：在单个"
+        "SQLite 读事务快照上固定 2–20 个命名空间的已注册名称、有效预占与"
+        "未过期冷却，只对不同空间的名称按规范名相同或同形建边，按连通分量"
+        "返回至少含 2 个节点的风险簇（快照总量超过 max_names 时返回 413，"
+        "不截断计算）。"
     ),
     lifespan=lifespan,
 )
@@ -119,6 +127,55 @@ CONFLICT_MESSAGE = "规范名相同或与命名空间内已有名称（含未过
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.post(
+    "/name-risk-clusters",
+    response_model=NameRiskClustersResponse,
+    responses={
+        413: {"description": "这些命名空间的快照节点总量超过 max_names，未进行任何分簇计算"},
+        422: {"description": "namespaces 数量不在 2–20 个范围、含重复项，或 max_names 超出 1–500"},
+    },
+)
+def name_risk_clusters(
+    payload: NameRiskClustersRequest, conn=Depends(get_db)
+) -> dict:
+    """跨命名空间同形风险簇：在同一个 SQLite 读事务快照上联合分析多个命名空间。
+
+    接收 2–20 个互不相同的命名空间与 max_names（1–500）。在单个读事务中
+    固定这些空间的**已注册名称、未过期未消费预占与未过期释放冷却**快照
+    （只读、不清理过期记录）；快照节点总量超过 max_names 时直接返回
+    `413 risk_snapshot_too_large`（附 snapshot_count 与 max_names），
+    **不截断快照、不做分簇计算**。
+
+    建边仅发生在**不同命名空间**的节点之间：规范名（NFKC+casefold）相同
+    记为 `normalized_match`，否则 confusables 同形记为 `confusable`；同一
+    命名空间内部不建边。随后按连通分量分簇，只返回至少含 2 个节点的簇——
+    因而 A-B、B-C 即使 A-C 并不直接冲突也会归入同一簇。节点以
+    `namespace` / `kind`（registered/reservation/released）/ `id` 稳定标识，
+    预占与冷却节点附 `expires_at`；边给出排序后的两端节点标识与 `reasons`。
+    簇、节点、边全部确定性排序（节点键 namespace、kind、id；簇按最小节点键，
+    cluster_id 从 1 开始）。
+    """
+    try:
+        return service.find_name_risk_clusters(
+            conn, payload.namespaces, payload.max_names
+        )
+    except service.RiskSnapshotTooLargeError as exc:
+        raise HTTPException(
+            status_code=413,  # 413 Payload Too Large（新旧 starlette 常量名不同，直接用字面值）
+            detail={
+                "error": "risk_snapshot_too_large",
+                "message": (
+                    "这些命名空间的已注册名称、有效预占与未过期冷却快照总量"
+                    f"为 {exc.snapshot_count}，超过请求给定的 max_names="
+                    f"{exc.limit}；未截断快照，也未进行分簇计算，请收窄命名空间"
+                    "或提高 max_names 后重试"
+                ),
+                "snapshot_count": exc.snapshot_count,
+                "max_names": exc.limit,
+            },
+        )
 
 
 @app.post(
