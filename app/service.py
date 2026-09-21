@@ -86,6 +86,20 @@
    脚本策略 PUT 的影响面扫描（违规明细 kind="released"）
 3. 过期冷却记录不参与任何判定，在每个写事务开始时惰性物理删除；
    GET /namespaces/{namespace}/cooldowns 只读列出仍有效的冷却记录
+
+跨空间同形风险簇（build_name_risk_clusters，POST /name-risk-clusters）：
+1. 在同一个 BEGIN DEFERRED 读事务中固定 2–20 个命名空间的已注册名称、
+   有效预占与未过期冷却快照（以同一时刻判定有效期，只读不清理），
+   快照总量超过 max_names 即抛 SnapshotTooLargeError（HTTP 413），
+   不做任何截断计算
+2. 只对不同命名空间的节点两两建边（规范名相同 -> normalized_match，
+   否则 confusables 同形 -> confusable），同一空间内部在写入时已保证
+   互不冲突，不参与建边
+3. 按并查集连通分量归簇：A-B、B-C 有边即同簇，即使 A-C 之间没有边；
+   只返回至少含 2 个节点的簇。节点以 namespace / kind / id 稳定标识
+   （预占与冷却附 expires_at），边列出 reason 并以节点规范序排列左右
+   端点；簇（按簇内最小节点）、节点（namespace、kind、id）、边
+   （左端、右端）全部确定性排序，与请求中命名空间的顺序无关
 """
 from __future__ import annotations
 
@@ -252,6 +266,19 @@ class BatchMixedScriptError(Exception):
     def __init__(self, items: list[dict]):
         super().__init__("mixed_script_violation")
         self.items = items
+
+
+class SnapshotTooLargeError(Exception):
+    """跨空间风险簇快照总量超过 max_names（HTTP 413，不做任何截断计算）。
+
+    snapshot_size 为各命名空间已注册名称、有效预占与未过期冷却的合计
+    节点数；max_names 为请求携带的上限。
+    """
+
+    def __init__(self, snapshot_size: int, max_names: int):
+        super().__init__("snapshot_too_large")
+        self.snapshot_size = snapshot_size
+        self.max_names = max_names
 
 
 def utc_now() -> datetime:
@@ -1533,3 +1560,188 @@ def list_cooldowns(conn: sqlite3.Connection, namespace: str) -> list[dict]:
         for row in rows
         if parse_expires_at(row["expires_at"]) > moment
     ]
+
+
+# ---------- 跨空间同形风险簇 ----------
+
+# 风险簇节点类别即冲突来源：已注册名称 / 有效预占 / 未过期释放冷却；
+# 取值用于节点的确定性排序（注册在前、预占居中、冷却在后）
+CLUSTER_KIND_ORDER = {
+    SOURCE_REGISTERED: 0,
+    SOURCE_RESERVATION: 1,
+    SOURCE_RELEASED: 2,
+}
+
+
+def _cluster_snapshot_entry(row, namespace: str, kind: str) -> dict:
+    """风险簇快照节点：namespace + kind + id 稳定标识，预占 / 冷却附 expires_at。"""
+    entry = {
+        "namespace": namespace,
+        "kind": kind,
+        "id": row["id"],
+        "original_name": row["original_name"],
+        "normalized_name": row["normalized_name"],
+    }
+    if kind in (SOURCE_RESERVATION, SOURCE_RELEASED):
+        entry["expires_at"] = row["expires_at"]
+    return entry
+
+
+def _namespace_cluster_snapshot(
+    conn: sqlite3.Connection, namespace: str, now: datetime
+) -> list[dict]:
+    """读取单个命名空间参与风险簇判定的全部节点（须在快照读事务内调用）。
+
+    顺序：已注册名称（id 升序）+ 有效预占（id 升序）+ 未过期冷却
+    （id 升序）；过期 / 已消费记录不参与（只读路径不做惰性清理）。
+    """
+    entries = [
+        _cluster_snapshot_entry(row, namespace, SOURCE_REGISTERED)
+        for row in conn.execute(
+            """
+            SELECT id, original_name, normalized_name
+            FROM display_names
+            WHERE namespace = ?
+            ORDER BY id
+            """,
+            (namespace,),
+        ).fetchall()
+    ]
+    entries.extend(
+        _cluster_snapshot_entry(row, namespace, SOURCE_RESERVATION)
+        for row in _active_reservation_rows(conn, namespace, now)
+    )
+    entries.extend(
+        _cluster_snapshot_entry(row, namespace, SOURCE_RELEASED)
+        for row in _active_cooldown_rows(conn, namespace, now)
+    )
+    return entries
+
+
+def _cluster_node_key(node: dict) -> tuple:
+    """节点的确定性排序键：命名空间、类别（注册 / 预占 / 冷却）、记录 id。"""
+    return (
+        node["namespace"],
+        CLUSTER_KIND_ORDER[node["kind"]],
+        node["id"],
+    )
+
+
+def _cluster_node_ref(node: dict) -> dict:
+    """边的端点引用：节点的稳定标识（namespace / kind / id）。"""
+    return {
+        "namespace": node["namespace"],
+        "kind": node["kind"],
+        "id": node["id"],
+    }
+
+
+def _connected_name_clusters(nodes: list[dict]) -> list[dict]:
+    """把快照节点按跨空间同形边归并为连通分量，返回确定性排序的簇列表。
+
+    节点先按 (namespace, kind, id) 规范序排列，输出与请求中命名空间的
+    顺序无关；只对不同命名空间的节点两两建边（规范名相同 ->
+    normalized_match，否则 confusables 同形 -> confusable）；连通分量按
+    并查集归并——A-B、B-C 有边即同簇，即使 A-C 之间没有边。只有至少
+    含 2 个节点的分量才作为风险簇返回；簇按簇内最小节点序、簇内节点按
+    规范序、边按（左端、右端）节点序排列。
+    """
+    ordered = sorted(nodes, key=_cluster_node_key)
+    count = len(ordered)
+
+    # 并查集：按下标归并，恒取下标小者为根，保证归并结果确定
+    parent = list(range(count))
+
+    def find(index: int) -> int:
+        root = index
+        while parent[root] != root:
+            root = parent[root]
+        while parent[index] != root:
+            parent[index], index = root, parent[index]
+        return root
+
+    # 跨空间建边：ordered 已排序且 left < right，边的生成顺序即规范序
+    edges: list[tuple[int, int, str]] = []
+    for left in range(count):
+        for right in range(left + 1, count):
+            a, b = ordered[left], ordered[right]
+            if a["namespace"] == b["namespace"]:
+                continue  # 只对不同空间的名称建边
+            if a["normalized_name"] == b["normalized_name"]:
+                reason = REASON_NORMALIZED_MATCH
+            elif is_confusable(a["normalized_name"], b["normalized_name"]):
+                reason = REASON_CONFUSABLE
+            else:
+                continue
+            edges.append((left, right, reason))
+            root_left, root_right = find(left), find(right)
+            if root_left != root_right:
+                parent[max(root_left, root_right)] = min(root_left, root_right)
+
+    members: dict[int, list[int]] = {}
+    for index in range(count):
+        members.setdefault(find(index), []).append(index)
+
+    clusters: list[dict] = []
+    # 簇按簇内最小节点（下标最小者）排序；孤立节点（分量大小 1）不构成风险簇
+    for root in sorted(members, key=lambda r: members[r][0]):
+        indices = members[root]
+        if len(indices) < 2:
+            continue
+        member_set = set(indices)
+        cluster_edges = [
+            {
+                "reason": reason,
+                "left": _cluster_node_ref(ordered[left]),
+                "right": _cluster_node_ref(ordered[right]),
+            }
+            for left, right, reason in edges
+            # 边两端必属同一连通分量，按左端归属即可；edges 本身已有序
+            if left in member_set
+        ]
+        clusters.append(
+            {
+                "nodes": [ordered[index] for index in indices],
+                "edges": cluster_edges,
+            }
+        )
+    return clusters
+
+
+def build_name_risk_clusters(
+    conn: sqlite3.Connection,
+    namespaces: list[str],
+    max_names: int,
+) -> dict:
+    """跨空间同形风险簇：单读事务快照 -> 跨空间建边 -> 连通分量归簇。
+
+    在同一个 BEGIN DEFERRED 读事务中固定全部请求命名空间的已注册名称、
+    有效预占与未过期冷却快照（以同一时刻判定有效期；过期 / 已消费记录
+    不参与，只读不清理），整个计算基于同一份快照。快照总量（节点数）
+    超过 max_names 即抛 SnapshotTooLargeError（HTTP 413），不做任何截断
+    计算。返回至少含 2 个节点的连通分量；簇、节点、边均确定性排序。
+    """
+    moment = utc_now()
+    conn.execute("BEGIN DEFERRED")
+    try:
+        nodes: list[dict] = []
+        for namespace in namespaces:
+            nodes.extend(_namespace_cluster_snapshot(conn, namespace, moment))
+        snapshot_size = len(nodes)
+        if snapshot_size > max_names:
+            raise SnapshotTooLargeError(snapshot_size, max_names)
+        clusters = _connected_name_clusters(nodes)
+        conn.commit()
+    except SnapshotTooLargeError:
+        conn.rollback()
+        raise
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    return {
+        "namespaces": list(namespaces),
+        "max_names": max_names,
+        "snapshot_size": snapshot_size,
+        "cluster_count": len(clusters),
+        "clusters": clusters,
+    }

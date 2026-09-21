@@ -306,6 +306,86 @@ class MergeResult(BaseModel):
     )
 
 
+# 跨空间同形风险簇：命名空间数量与快照总量上限
+MIN_CLUSTER_NAMESPACES = 2
+MAX_CLUSTER_NAMESPACES = 20
+MAX_CLUSTER_SNAPSHOT = 500
+
+
+class NameRiskClustersRequest(BaseModel):
+    """跨空间同形风险簇请求体：2–20 个互不相同的命名空间 + 快照总量上限。"""
+
+    namespaces: list[NamespaceStr] = Field(
+        min_length=MIN_CLUSTER_NAMESPACES,
+        max_length=MAX_CLUSTER_NAMESPACES,
+        examples=[["chat", "chat-v2"]],
+        description="参与判定的命名空间（2–20 个，互不相同）；只对不同空间的名称建边",
+    )
+    max_names: int = Field(
+        ge=1,
+        le=MAX_CLUSTER_SNAPSHOT,
+        examples=[500],
+        description=(
+            "快照总量上限（全部命名空间的已注册名称 + 有效预占 + 未过期冷却合计）；"
+            "超过即 413，不做任何截断计算"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _require_distinct_namespaces(self) -> "NameRiskClustersRequest":
+        if len(set(self.namespaces)) != len(self.namespaces):
+            raise ValueError("namespaces 必须互不相同（重复空间无法构成跨空间比较）")
+        return self
+
+
+class RiskClusterNodeRef(BaseModel):
+    """风险簇节点的稳定标识：命名空间 + 类别 + 记录 id。"""
+
+    namespace: str
+    kind: Literal["registered", "reservation", "released"] = Field(
+        description="节点类别：已注册名称 / 有效预占 / 未过期释放冷却"
+    )
+    id: int = Field(description="记录在所属表（display_names / name_reservations / name_cooldowns）中的 id")
+
+
+class RiskClusterNode(RiskClusterNodeRef):
+    """风险簇节点：稳定标识 + 名称内容；预占与冷却附 expires_at。"""
+
+    original_name: str
+    normalized_name: str
+    expires_at: str | None = Field(
+        default=None,
+        description="仅 kind 为 reservation / released 时出现：预占 / 冷却的到期时刻",
+    )
+
+
+class RiskClusterEdge(BaseModel):
+    """跨空间同形边：left / right 为按节点规范序排列的两端（不同命名空间）。"""
+
+    reason: Literal["normalized_match", "confusable"]
+    left: RiskClusterNodeRef
+    right: RiskClusterNodeRef
+
+
+class NameRiskCluster(BaseModel):
+    """单个风险簇：同一连通分量内的全部节点与跨空间边（均确定性排序）。"""
+
+    nodes: list[RiskClusterNode]
+    edges: list[RiskClusterEdge]
+
+
+class NameRiskClustersResponse(BaseModel):
+    """跨空间同形风险簇响应：只含至少 2 个节点的连通分量。"""
+
+    namespaces: list[str] = Field(description="参与判定的命名空间（按请求顺序回显）")
+    max_names: int
+    snapshot_size: int = Field(
+        description="参与判定的快照节点总数（全部命名空间合计，含未入簇的孤立节点）"
+    )
+    cluster_count: int = Field(description="至少含 2 个节点的风险簇数量")
+    clusters: list[NameRiskCluster]
+
+
 class ErrorDetail(BaseModel):
     error: str
     message: str
